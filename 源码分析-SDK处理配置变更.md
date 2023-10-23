@@ -1,6 +1,12 @@
-# 源码分析-配置变更SDK处理流程
+# 配置变更`SDK`处理流程讲解
 
-此文章主要讲解，当SDK监听的配置发生变更时，SDK的处理流程，主要流程如下：
+## 配置变更`SDK`处理流程图
+
+此文章主要讲解，当`SDK`监听的配置发生变更时，`Server`端发送`ConfigCHangeNotifyRequest`至`SDK`，`SDK`的处理流程图如下所示：
+
+![配置变更SDK处理流程图](https://skyxg.oss-cn-beijing.aliyuncs.com/images/202310232226852.png)
+
+## 源码分析
 
 首先`SDK`的入口在`ClientWorker#initRpcClientHandler`中，当`SDK`启动时，会调用该方法，将相关请求处理器进行注册，这里我们主要关注`ConfigChangeNotifyRequest`（配置变更通知请求）,主要的逻辑如下：
 
@@ -23,15 +29,16 @@ public class ClientWorker implements Closeable {
                 LOGGER.info("[{}] [server-push] config changed. dataId={}, group={},tenant={}",
                             rpcClientInner.getName(), configChangeNotifyRequest.getDataId(),
                             configChangeNotifyRequest.getGroup(), configChangeNotifyRequest.getTenant());
-                // 获取对应的groupKey
+                // SDK端首先根据发生变更的配置的元数据组成groupKey
                 String groupKey = GroupKey.getKeyTenant(configChangeNotifyRequest.getDataId(),
                                                         configChangeNotifyRequest.getGroup(), configChangeNotifyRequest.getTenant());
-
+			   // 通过groupKey获取到CacheData
                 CacheData cacheData = cacheMap.get().get(groupKey);
                 if (cacheData != null) {
                     synchronized (cacheData) {
-                        // 将cacheData标记为已经发生变化
+                        // 将cacheData标记为已接收通知改变
                         cacheData.getReceiveNotifyChanged().set(true);
+                        // 将cacheData标记为与服务端不一致
                         cacheData.setConsistentWithServer(false);
                         // 然后再触发listenConfig
                         notifyListenConfig();
