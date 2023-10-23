@@ -1,4 +1,204 @@
-# 
+# 源码分析-配置变更SDK处理流程
+
+此文章主要讲解，当SDK监听的配置发生变更时，SDK的处理流程，主要流程如下：
+
+首先`SDK`的入口在`ClientWorker#initRpcClientHandler`中，当`SDK`启动时，会调用该方法，将相关请求处理器进行注册，这里我们主要关注`ConfigChangeNotifyRequest`（配置变更通知请求）,主要的逻辑如下：
+
+- 当配置发生变更时，`Server`端会发送`ConfigChangeNotifyRequest`（配置变更通知请求）通知客户端
+- `SDK`端首先根据发生变更的配置的元数据组成`groupKey`，再从`ClientWorker#cacheMap`中获取到对应的`cahceMap`
+- 并且将`cacheMap`的`receiveNotifyChanged == true` (用于标识是否接收变更的通知，当接收到服务端变更通知时，肯定是将该标识置为`true`)，`consistentWithServer == false`(用于标识是否与服务端一致，当接收到服务端变更通知时，肯定是与服务端信息不一致，所以置为`false`)
+- 然后触发`ClientWorker#notifyListenConfig`
+
+源码如下：
+
+```java
+public class ClientWorker implements Closeable {
+    private void initRpcClientHandler(final RpcClient rpcClientInner) {
+        /*
+         * Register Config Change /Config ReSync Handler
+         */
+        rpcClientInner.registerServerRequestHandler((request, connection) -> {
+            if (request instanceof ConfigChangeNotifyRequest) {
+                ConfigChangeNotifyRequest configChangeNotifyRequest = (ConfigChangeNotifyRequest) request;
+                LOGGER.info("[{}] [server-push] config changed. dataId={}, group={},tenant={}",
+                            rpcClientInner.getName(), configChangeNotifyRequest.getDataId(),
+                            configChangeNotifyRequest.getGroup(), configChangeNotifyRequest.getTenant());
+                // 获取对应的groupKey
+                String groupKey = GroupKey.getKeyTenant(configChangeNotifyRequest.getDataId(),
+                                                        configChangeNotifyRequest.getGroup(), configChangeNotifyRequest.getTenant());
+
+                CacheData cacheData = cacheMap.get().get(groupKey);
+                if (cacheData != null) {
+                    synchronized (cacheData) {
+                        // 将cacheData标记为已经发生变化
+                        cacheData.getReceiveNotifyChanged().set(true);
+                        cacheData.setConsistentWithServer(false);
+                        // 然后再触发listenConfig
+                        notifyListenConfig();
+                    }
+
+                }
+                return new ConfigChangeNotifyResponse();
+            }
+            return null;
+        });
+        // 其他逻辑处理
+        ...
+    }
+}
+```
+
+
+
+```java
+        public void startInternal() {
+            executor.schedule(() -> {
+                while (!executor.isShutdown() && !executor.isTerminated()) {
+                    try {
+                        // 每隔5秒执行一次配置监听
+                        listenExecutebell.poll(5L, TimeUnit.SECONDS);
+                        if (executor.isShutdown() || executor.isTerminated()) {
+                            continue;
+                        }
+                        executeConfigListen();
+                    } catch (Throwable e) {
+                        LOGGER.error("[rpc listen execute] [rpc listen] exception", e);
+                        try {
+                            Thread.sleep(50L);
+                        } catch (InterruptedException interruptedException) {
+                            //ignore
+                        }
+                        notifyListenConfig();
+                    }
+                }
+            }, 0L, TimeUnit.MILLISECONDS);
+            
+        }
+```
+
+
+
+```java
+        @Override
+        public void executeConfigListen() {
+            
+            Map<String, List<CacheData>> listenCachesMap = new HashMap<>(16);
+            Map<String, List<CacheData>> removeListenCachesMap = new HashMap<>(16);
+            long now = System.currentTimeMillis();
+            boolean needAllSync = now - lastAllSyncTime >= ALL_SYNC_INTERNAL;
+            for (CacheData cache : cacheMap.get().values()) {
+                
+                synchronized (cache) {
+					
+                    checkLocalConfig(cache);
+					
+                    // 如果与服务端一致，那么只需要检查cache中的md5与listener中的md5是否一致就好了，
+                    // 在checkListenerMd5()中，如果不一致则会进行通知
+                    // 如果说cache与服务端一致，并且距离最后一次同步没有达到需要全部同步的间隔，那么则跳过该cache的处理    
+                    // check local listeners consistent.
+                    if (cache.isConsistentWithServer()) {
+                        cache.checkListenerMd5();
+                        if (!needAllSync) {
+                            continue;
+                        }
+                    }
+    
+                    // 如果使用的是本地的配置信息，那么其实不需要对该cacheData进行处理
+                    // If local configuration information is used, then skip the processing directly.
+                    if (cache.isUseLocalConfigInfo()) {
+                        continue;
+                    }
+    				
+                    // 如果配置已经丢弃，那么则加入removeListenCachesMap，否则加入listenCachesMap
+                    if (!cache.isDiscard()) {
+                        List<CacheData> cacheDatas = listenCachesMap.computeIfAbsent(String.valueOf(cache.getTaskId()),
+                                k -> new LinkedList<>());
+                        cacheDatas.add(cache);
+                    } else {
+                        List<CacheData> cacheDatas = removeListenCachesMap.computeIfAbsent(
+                                String.valueOf(cache.getTaskId()), k -> new LinkedList<>());
+                        cacheDatas.add(cache);
+                    }
+                }
+                
+            }
+            
+            // 去检查判断是否有没有内容改变
+            //execute check listen ,return true if has change keys.
+            boolean hasChangedKeys = checkListenCache(listenCachesMap);
+            
+            // 将移除的cacheData去移除订阅，并且从CacheMap中移除对应的缓存
+            //execute check remove listen.
+            checkRemoveListenCache(removeListenCachesMap);
+            
+            // 如果这次处理是因为达到了需要全部同步的间隔，那么则更新最后同步的时间
+            if (needAllSync) {
+                lastAllSyncTime = now;
+            }
+            
+            // 如果说有改变的配置，那么需要再次进行处理，我初看时也很纳闷，md5明明已经进行同步了，为什么需要再次进行处理
+            // 关联ISSUE：https://github.com/alibaba/nacos/issues/9729
+            //If has changed keys,notify re sync md5.
+            if (hasChangedKeys) {
+                notifyListenConfig();
+            }
+    
+        }
+		
+		/**
+		 * 主要是用于检查是否使用本地配置，并且更新cacheData对象
+         * Checks and handles local configuration for a given CacheData object. This method evaluates the use of
+         * failover files for local configuration storage and updates the CacheData accordingly.
+         *
+         * @param cacheData The CacheData object to be processed.
+         */
+        public void checkLocalConfig(CacheData cacheData) {
+            final String dataId = cacheData.dataId;
+            final String group = cacheData.group;
+            final String tenant = cacheData.tenant;
+            final String envName = cacheData.envName;
+    
+            // Check if a failover file exists for the specified dataId, group, and tenant.
+            File file = LocalConfigInfoProcessor.getFailoverFile(envName, dataId, group, tenant);
+    
+            // If not using local config info and a failover file exists, load and use it.
+            if (!cacheData.isUseLocalConfigInfo() && file.exists()) {
+                String content = LocalConfigInfoProcessor.getFailover(envName, dataId, group, tenant);
+                final String md5 = MD5Utils.md5Hex(content, Constants.ENCODE);
+                cacheData.setUseLocalConfigInfo(true);
+                cacheData.setLocalConfigInfoVersion(file.lastModified());
+                cacheData.setContent(content);
+                LOGGER.warn(
+                        "[{}] [failover-change] failover file created. dataId={}, group={}, tenant={}, md5={}, content={}",
+                        envName, dataId, group, tenant, md5, ContentUtils.truncateContent(content));
+                return;
+            }
+    
+            // If use local config info, but the failover file is deleted, switch back to server config.
+            if (cacheData.isUseLocalConfigInfo() && !file.exists()) {
+                cacheData.setUseLocalConfigInfo(false);
+                LOGGER.warn("[{}] [failover-change] failover file deleted. dataId={}, group={}, tenant={}", envName,
+                        dataId, group, tenant);
+                return;
+            }
+    
+            // When the failover file content changes, indicating a change in local configuration.
+            if (cacheData.isUseLocalConfigInfo() && file.exists()
+                    && cacheData.getLocalConfigInfoVersion() != file.lastModified()) {
+                String content = LocalConfigInfoProcessor.getFailover(envName, dataId, group, tenant);
+                final String md5 = MD5Utils.md5Hex(content, Constants.ENCODE);
+                cacheData.setUseLocalConfigInfo(true);
+                cacheData.setLocalConfigInfoVersion(file.lastModified());
+                cacheData.setContent(content);
+                LOGGER.warn(
+                        "[{}] [failover-change] failover file changed. dataId={}, group={}, tenant={}, md5={}, content={}",
+                        envName, dataId, group, tenant, md5, ContentUtils.truncateContent(content));
+            }
+        }
+```
+
+
+
 
 ```java
 public class ClientWorker implements Closeable {
@@ -66,6 +266,62 @@ public class ClientWorker implements Closeable {
 ```
 
 
+```java
+        @Override
+public void executeConfigListen() {
+        
+        Map<String, List<CacheData>> listenCachesMap = new HashMap<>(16);
+        Map<String, List<CacheData>> removeListenCachesMap = new HashMap<>(16);
+        long now = System.currentTimeMillis();
+        boolean needAllSync = now - lastAllSyncTime >= ALL_SYNC_INTERNAL;
+        for (CacheData cache : cacheMap.get().values()) {
+
+synchronized (cache) {
+        
+        checkLocalConfig(cache);
+        
+        // check local listeners consistent.
+        if (cache.isConsistentWithServer()) {
+        cache.checkListenerMd5();
+        if (!needAllSync) {
+        continue;
+        }
+        }
+        
+        // If local configuration information is used, then skip the processing directly.
+        if (cache.isUseLocalConfigInfo()) {
+        continue;
+        }
+        
+        if (!cache.isDiscard()) {
+        List<CacheData> cacheDatas = listenCachesMap.computeIfAbsent(String.valueOf(cache.getTaskId()),
+        k -> new LinkedList<>());
+        cacheDatas.add(cache);
+        } else {
+        List<CacheData> cacheDatas = removeListenCachesMap.computeIfAbsent(
+        String.valueOf(cache.getTaskId()), k -> new LinkedList<>());
+        cacheDatas.add(cache);
+        }
+        }
+        
+        }
+        
+        //execute check listen ,return true if has change keys.
+        boolean hasChangedKeys = checkListenCache(listenCachesMap);
+        
+        //execute check remove listen.
+        checkRemoveListenCache(removeListenCachesMap);
+        
+        if (needAllSync) {
+        lastAllSyncTime = now;
+        }
+        //If has changed keys,notify re sync md5.
+        if (hasChangedKeys) {
+        notifyListenConfig();
+        }
+        
+        }
+```
 
 
 
